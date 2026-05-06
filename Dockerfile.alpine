@@ -40,8 +40,8 @@ RUN CGO_ENABLED=0 \
       -o /workspace/sops \
       ./cmd/sops
 
-RUN file /workspace/sops | grep -q "RISC-V" || \
-    (echo "ERROR: binary is not riscv64" && file /workspace/sops && exit 1)
+RUN readelf -h /workspace/sops | grep -q "RISC-V" || \
+    (echo "ERROR: binary is not riscv64" && readelf -h /workspace/sops && exit 1)
 
 
 # ── Stage 2: Minimal Alpine runtime ───────────────────────────────────────────

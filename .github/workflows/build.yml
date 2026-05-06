@@ -238,7 +238,7 @@ jobs:
           docker run --rm \
             --platform linux/riscv64 \
             -v "/tmp/artifacts:/artifacts:ro" \
-            debian:bookworm-slim \
+            alpine:3.23 \
             /artifacts/sops-${SOPS_VERSION}.linux.riscv64 --version
 
       - name: Confirm version string
@@ -246,7 +246,7 @@ jobs:
           OUTPUT=$(docker run --rm \
             --platform linux/riscv64 \
             -v "/tmp/artifacts:/artifacts:ro" \
-            debian:bookworm-slim \
+            alpine:3.23 \
             /artifacts/sops-${SOPS_VERSION}.linux.riscv64 --version 2>&1)
           echo "sops output: ${OUTPUT}"
           echo "${OUTPUT}" | grep -q "${SOPS_VERSION#v}" \
