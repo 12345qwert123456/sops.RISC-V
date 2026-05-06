@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================
+# SOPS v3.12.2 — RISC-V (linux/riscv64) Alpine image
+# ============================================================
+# Minimal (~12 MB) Alpine-based image for riscv64.
+# Does NOT include gnupg or cloud CLI tools.
+#
+# Usage:
+#   docker buildx build \
+#     --platform linux/riscv64 \
+#     --tag ghcr.io/<owner>/sops-riscv64:v3.12.2-alpine \
+#     --file Dockerfile.alpine \
+#     .
+# ============================================================
+
+ARG SOPS_VERSION=v3.12.2
+ARG GO_IMAGE=golang:1.25.9-bookworm
+ARG RUNTIME_IMAGE=alpine:3.23
+
+# ── Stage 1: Builder (same as Debian variant) ─────────────────────────────────
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS builder
+
+ARG SOPS_VERSION
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+ADD https://github.com/getsops/sops/archive/refs/tags/${SOPS_VERSION}.tar.gz /tmp/sops.tar.gz
+RUN tar -xzf /tmp/sops.tar.gz --strip-components=1 -C /workspace
+
+RUN go mod download
+
+RUN CGO_ENABLED=0 \
+    GOOS=${TARGETOS:-linux} \
+    GOARCH=${TARGETARCH:-riscv64} \
+    go build \
+      -trimpath \
+      -ldflags="-s -w -X github.com/getsops/sops/v3/version.Version=${SOPS_VERSION}" \
+      -o /workspace/sops \
+      ./cmd/sops
+
+RUN file /workspace/sops | grep -q "RISC-V" || \
+    (echo "ERROR: binary is not riscv64" && file /workspace/sops && exit 1)
+
+
+# ── Stage 2: Minimal Alpine runtime ───────────────────────────────────────────
+FROM ${RUNTIME_IMAGE}
+
+ARG SOPS_VERSION
+
+RUN apk --no-cache add \
+      ca-certificates \
+      vim \
+    && update-ca-certificates
+
+ENV EDITOR=vim
+
+COPY --from=builder /workspace/sops /usr/local/bin/sops
+
+RUN sops --version
+
+LABEL org.opencontainers.image.title="sops-alpine" \
+      org.opencontainers.image.description="SOPS: Secrets OPerationS — riscv64 community build (Alpine)" \
+      org.opencontainers.image.version="${SOPS_VERSION}" \
+      org.opencontainers.image.url="https://github.com/getsops/sops" \
+      org.opencontainers.image.source="https://github.com/getsops/sops" \
+      org.opencontainers.image.licenses="MPL-2.0" \
+      org.opencontainers.image.architecture="riscv64"
+
+ENTRYPOINT ["sops"]

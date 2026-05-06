@@ -1,0 +1,254 @@
+# =============================================================================
+# GitHub Actions: Build SOPS for linux/riscv64
+# =============================================================================
+# Triggers:
+#   - push to main (any file change)
+#   - weekly schedule (keeps up with upstream SOPS releases)
+#   - manual workflow_dispatch (with optional version override)
+#
+# Jobs:
+#   build-binary   → cross-compile a static riscv64 ELF, attach to GH release
+#   build-image    → build & push Debian + Alpine Docker images to GHCR
+#   verify         → run the binary inside a riscv64 container via QEMU
+# =============================================================================
+
+name: Build SOPS riscv64
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 1"   # Weekly — Monday 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      sops_version:
+        description: "SOPS version tag (e.g. v3.12.2)"
+        required: false
+        default: "v3.12.2"
+
+env:
+  SOPS_VERSION: ${{ github.event.inputs.sops_version || 'v3.12.2' }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/sops-riscv64
+
+permissions:
+  contents: write       # create GitHub releases and upload assets
+  packages: write       # push to GHCR
+  id-token: write       # cosign OIDC signing (optional, for provenance)
+
+jobs:
+  # ── Job 1: Cross-compile static binary ──────────────────────────────────────
+  build-binary:
+    name: Cross-compile riscv64 binary
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go 1.25
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: false
+
+      - name: Download SOPS source
+        run: |
+          mkdir -p /tmp/sops-src
+          curl -fsSL \
+            "https://github.com/getsops/sops/archive/refs/tags/${SOPS_VERSION}.tar.gz" \
+            | tar -xz --strip-components=1 -C /tmp/sops-src
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: go-mod-${{ hashFiles('/tmp/sops-src/go.sum') }}
+          restore-keys: go-mod-
+
+      - name: Download Go modules
+        working-directory: /tmp/sops-src
+        run: go mod download
+
+      - name: Build static riscv64 binary
+        working-directory: /tmp/sops-src
+        run: |
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=riscv64 \
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X github.com/getsops/sops/v3/version.Version=${SOPS_VERSION}" \
+            -o "/tmp/sops-${SOPS_VERSION}.linux.riscv64" \
+            ./cmd/sops
+
+      - name: Verify binary architecture
+        run: |
+          file "/tmp/sops-${SOPS_VERSION}.linux.riscv64"
+          file "/tmp/sops-${SOPS_VERSION}.linux.riscv64" | grep -q "RISC-V" \
+            || (echo "::error::Produced binary is not riscv64" && exit 1)
+
+      - name: Generate checksum
+        run: |
+          cd /tmp
+          sha256sum "sops-${SOPS_VERSION}.linux.riscv64" \
+            > "sops-${SOPS_VERSION}.linux.riscv64.sha256"
+          cat "sops-${SOPS_VERSION}.linux.riscv64.sha256"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sops-riscv64-binary
+          path: |
+            /tmp/sops-${{ env.SOPS_VERSION }}.linux.riscv64
+            /tmp/sops-${{ env.SOPS_VERSION }}.linux.riscv64.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub Release
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.SOPS_VERSION }}
+          name: "SOPS ${{ env.SOPS_VERSION }} — riscv64"
+          body: |
+            ## SOPS ${{ env.SOPS_VERSION }} for linux/riscv64
+
+            Community-built riscv64 binary and Docker images of [SOPS ${{ env.SOPS_VERSION }}](https://github.com/getsops/sops/releases/tag/${{ env.SOPS_VERSION }}).
+
+            ### Install
+            ```bash
+            curl -LO https://github.com/${{ github.repository }}/releases/download/${{ env.SOPS_VERSION }}/sops-${{ env.SOPS_VERSION }}.linux.riscv64
+            chmod +x sops-${{ env.SOPS_VERSION }}.linux.riscv64
+            sudo mv sops-${{ env.SOPS_VERSION }}.linux.riscv64 /usr/local/bin/sops
+            ```
+
+            ### Docker
+            ```bash
+            docker pull ghcr.io/${{ env.IMAGE_NAME }}:${{ env.SOPS_VERSION }}
+            docker pull ghcr.io/${{ env.IMAGE_NAME }}:${{ env.SOPS_VERSION }}-alpine
+            ```
+
+            Built with Go `1.25.x`, `CGO_ENABLED=0`, `GOARCH=riscv64`.  
+            See [research-report.md](https://github.com/${{ github.repository }}/blob/main/research-report.md) for full compatibility analysis.
+          files: |
+            /tmp/sops-${{ env.SOPS_VERSION }}.linux.riscv64
+            /tmp/sops-${{ env.SOPS_VERSION }}.linux.riscv64.sha256
+          draft: false
+          prerelease: false
+
+  # ── Job 2: Build & push Docker images ───────────────────────────────────────
+  build-image:
+    name: Build Docker images
+    runs-on: ubuntu-24.04
+    needs: build-binary
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU (for riscv64 final-stage)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Debian image
+        id: meta-debian
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.SOPS_VERSION }}
+            type=raw,value=latest
+
+      - name: Build and push Debian image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/riscv64
+          push: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          tags: ${{ steps.meta-debian.outputs.tags }}
+          labels: ${{ steps.meta-debian.outputs.labels }}
+          build-args: |
+            SOPS_VERSION=${{ env.SOPS_VERSION }}
+          cache-from: type=gha,scope=debian
+          cache-to: type=gha,mode=max,scope=debian
+
+      - name: Extract metadata for Alpine image
+        id: meta-alpine
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.SOPS_VERSION }}-alpine
+            type=raw,value=latest-alpine
+
+      - name: Build and push Alpine image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.alpine
+          platforms: linux/riscv64
+          push: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          tags: ${{ steps.meta-alpine.outputs.tags }}
+          labels: ${{ steps.meta-alpine.outputs.labels }}
+          build-args: |
+            SOPS_VERSION=${{ env.SOPS_VERSION }}
+          cache-from: type=gha,scope=alpine
+          cache-to: type=gha,mode=max,scope=alpine
+
+  # ── Job 3: Smoke-test binary inside riscv64 container ───────────────────────
+  verify:
+    name: Verify riscv64 binary
+    runs-on: ubuntu-24.04
+    needs: build-binary
+
+    steps:
+      - name: Set up QEMU for riscv64
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: riscv64
+
+      - name: Download binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sops-riscv64-binary
+          path: /tmp/artifacts
+
+      - name: Make binary executable
+        run: chmod +x "/tmp/artifacts/sops-${SOPS_VERSION}.linux.riscv64"
+
+      - name: Run binary inside riscv64 container (QEMU)
+        run: |
+          docker run --rm \
+            --platform linux/riscv64 \
+            -v "/tmp/artifacts:/artifacts:ro" \
+            debian:bookworm-slim \
+            /artifacts/sops-${SOPS_VERSION}.linux.riscv64 --version
+
+      - name: Confirm version string
+        run: |
+          OUTPUT=$(docker run --rm \
+            --platform linux/riscv64 \
+            -v "/tmp/artifacts:/artifacts:ro" \
+            debian:bookworm-slim \
+            /artifacts/sops-${SOPS_VERSION}.linux.riscv64 --version 2>&1)
+          echo "sops output: ${OUTPUT}"
+          echo "${OUTPUT}" | grep -q "${SOPS_VERSION#v}" \
+            || (echo "::error::Version string '${SOPS_VERSION}' not found in output: ${OUTPUT}" && exit 1)
+          echo "::notice::Verification passed — sops ${SOPS_VERSION} runs correctly on riscv64"
